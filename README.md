@@ -1,11 +1,14 @@
-# Document Converter API — Development & Production Deployment Guide
+# Document Converter API (FastAPI) — Development, Deployment, Security & Monitoring Guide
 
-FastAPI conversion service (PDF / Word / Excel / PPTX / HEIC / images / OCR) plus a Go JWT auth service,
-deployed on a **Hostinger VPS (Ubuntu 24.04)** behind **Nginx + HTTPS**, running in **hardened Docker containers**.
+FastAPI conversion service (PDF / Word / Excel / PPTX / HEIC / images / OCR) deployed on a
+**Hostinger VPS (Ubuntu 24.04)** behind **Nginx + HTTPS**, running in a **hardened Docker container**, with
+full **activity logging, health checks and alerting**.
 
-> **Assumptions** (adjust to your real project): FastAPI entry point is `app.main:app`, the Go auth service
-> listens on `:8080`, and it uses PostgreSQL. Check `Procfile`, `go-auth/config/database.go` and `example_env`
-> for the real commands and variable names. Replace `example.com` with your domain everywhere.
+> **Scope:** this guide covers the FastAPI project only. Everything related to `go-auth` is intentionally left out.
+>
+> **Assumptions** (adjust to your real project): the entry point is `app.main:app`, and `apt.txt` lists the
+> system packages. Check `Procfile` and `example_env` for the real commands and variable names.
+> Replace `example.com` with your domain everywhere.
 
 ---
 
@@ -15,12 +18,12 @@ deployed on a **Hostinger VPS (Ubuntu 24.04)** behind **Nginx + HTTPS**, running
 2. [Local development](#2-local-development)
 3. [Fix these in the code BEFORE going public](#3-fix-these-in-the-code-before-going-public)
 4. [Hostinger VPS: first-time setup](#4-hostinger-vps-first-time-setup)
-5. [Server hardening (SSH, firewall, fail2ban, updates)](#5-server-hardening)
+5. [Server hardening](#5-server-hardening)
 6. [Install Docker](#6-install-docker)
 7. [Deploy the application](#7-deploy-the-application)
 8. [Nginx + free HTTPS certificate](#8-nginx--free-https-certificate)
-9. [Application-level security](#9-application-level-security)
-10. [Cleanup, backups, logs, monitoring](#10-cleanup-backups-logs-monitoring)
+9. [Security layers summary](#9-security-layers-summary)
+10. [Cleanup & backups](#10-cleanup--backups)
 11. [Monitoring, logging, auditing & alerting](#11-monitoring-logging-auditing--alerting)
 12. [Update / rollback workflow](#12-update--rollback-workflow)
 13. [Verification & troubleshooting](#13-verification--troubleshooting)
@@ -40,22 +43,20 @@ Internet
 └───────────┬─────────────┘
             ▼
 ┌─────────────────────────┐
-│ Nginx (host)            │  TLS, rate limits, upload size limit, headers
-└───────┬───────────┬─────┘
-        │           │
- 127.0.0.1:8000  127.0.0.1:8080       ← bound to loopback, NOT public
-        ▼           ▼
- ┌────────────┐ ┌────────────┐   ┌──────────────┐
- │ FastAPI    │ │ Go auth    │──▶│ PostgreSQL   │  (no published port)
- │ container  │ │ container  │   │ container    │
- └─────┬──────┘ └────────────┘   └──────────────┘
-       ▼
-  ./data/uploads  ./data/converted_files  ./data/outputs   (volumes)
+│ Nginx (host)            │  TLS, rate limits, upload size limit, headers, logs
+└───────────┬─────────────┘
+            │  127.0.0.1:8000   ← loopback only, NOT public
+            ▼
+   ┌─────────────────┐
+   │ FastAPI (Docker)│  gunicorn + uvicorn workers, non-root, limited CPU/RAM
+   └────────┬────────┘
+            ▼
+  ./data/uploads  ./data/converted_files  ./data/outputs  ./data/logs   (volumes)
 ```
 
 Why this layout:
 
-- Only Nginx is exposed. App and DB ports are never reachable from the internet.
+- Only Nginx is exposed. The app port is never reachable from the internet.
 - The converter processes **untrusted files** (LibreOffice, Ghostscript, Tesseract, Pillow). Running them in a
   container with dropped privileges limits the damage if one of those tools has a vulnerability.
 
@@ -67,7 +68,7 @@ Why this layout:
 ## 2. Local development
 
 ### Prerequisites
-Python 3.11+, Go 1.22+ (for `go-auth`), Git, and system tools:
+Python 3.11+, Git, and the system tools (your `apt.txt` is the source of truth):
 
 ```bash
 # Ubuntu/Debian
@@ -75,9 +76,8 @@ sudo apt update
 sudo apt install -y libreoffice ghostscript tesseract-ocr poppler-utils libheif-dev fonts-dejavu fonts-liberation
 # macOS: brew install libreoffice ghostscript tesseract poppler libheif
 ```
-(Your `apt.txt` already lists the system packages the app needs. That is the source of truth.)
 
-### Run the FastAPI app
+### Run
 
 ```bash
 python3 -m venv .venv
@@ -94,22 +94,12 @@ python run.py                # or: uvicorn app.main:app --reload --port 8000
 - Quick manual tests: `api.http` (VS Code REST Client) or `frontend/test_new_api.html`
 - Frontend: set the API base URL in `frontend/js/config.js`
 
-### Run the Go auth service
-
-```bash
-cd go-auth
-cp example_env .env          # DB credentials, JWT secret, SMTP settings
-go run .
-# tests: go-auth/tests/auth_test.http
-```
-
-### `.gitignore` (add/verify — your tree shows user data inside the repo)
+### `.gitignore` (add/verify. Your tree shows user data inside the repo)
 
 ```gitignore
 .env
 *.env
 !example_env
-go-auth/.env
 .venv/
 __pycache__/
 *.pyc
@@ -125,9 +115,9 @@ Remove already-committed user files and make sure no secret was ever committed:
 ```bash
 git rm -r --cached uploads converted_files outputs 2>/dev/null
 git commit -m "Stop tracking runtime data"
-git log --all --oneline -- .env go-auth/.env     # should print nothing
+git log --all --oneline -- .env      # should print nothing
 ```
-If a secret **was** committed, treat it as leaked and rotate it (new JWT secret, DB password, SMTP password).
+If a secret **was** committed (SMTP password, API key), treat it as leaked and rotate it.
 
 ### `.dockerignore`
 
@@ -143,6 +133,7 @@ data
 *.md
 FULL_PROJECT_DOCUMENTATION.txt
 openapi.json
+go-auth
 frontend/test_new_api.html
 ```
 
@@ -177,7 +168,7 @@ app.add_middleware(
     allow_origins=[o for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o],  # never "*" with credentials
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
 @app.get("/health", include_in_schema=False)
@@ -206,22 +197,55 @@ def assert_public_url(url: str) -> None:
 ```
 
 Also: set connect/read timeouts, cap download size (e.g. 20 MB), limit redirects and re-validate each hop, and
-if you render pages with a headless browser, treat the rendered page as hostile (no file:// access, no
+if you render pages with a headless browser, treat the rendered page as hostile (no `file://` access, no
 credentials, strict timeout).
 
-### 3.3 Authenticate and authorize every endpoint
+### 3.3 Access control (decide how callers are allowed in)
 
-- The Go service issues JWTs. **FastAPI must verify them** (signature, expiry) with a dependency on every
-  conversion/editor/download route. Don't trust a user ID sent in the request body.
-- `JWT_SECRET` must be random, at least 32 bytes, identical in both services, and only in `.env`.
-- Download/preview routes must check that the file/job belongs to the caller. Job IDs should be random (uuid4),
-  never sequential.
-- Never expose directory listings (`StaticFiles` over `uploads/`, `converted_files/` or `outputs/` is a data leak).
+A converter usually has no user accounts, so decide which of these fits you:
+
+**A. Public website tool (anyone can convert)**
+- Rely on Nginx rate limits (section 8), upload size limits, and a CAPTCHA (e.g. Cloudflare Turnstile) on the
+  upload form to stop bots.
+- Job/file IDs must be random (`uuid4().hex`), never sequential, so a result link can't be guessed.
+- Delete files quickly (section 10) so nothing sits around.
+- Optional: store a random session cookie (`HttpOnly`, `Secure`, `SameSite=Lax`) with each job and only allow
+  that session to download it.
+
+**B. Private API / partner use (only your apps may call it)**: require an API key:
+
+```python
+import logging, os, secrets
+from fastapi import HTTPException, Request, Security
+from fastapi.security import APIKeyHeader
+from app.security_logging import audit_event      # created in section 11.3
+
+_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+# .env:  API_KEYS=web:KEY1,partner:KEY2     (generate keys with: openssl rand -hex 32)
+API_KEYS = dict(p.split(":", 1) for p in os.getenv("API_KEYS", "").split(",") if ":" in p)
+
+def require_api_key(request: Request, key: str | None = Security(_header)) -> str:
+    if key:
+        for name, value in API_KEYS.items():
+            if secrets.compare_digest(key, value):
+                request.state.user_id = name        # shows up in the audit log
+                return name
+    audit_event("api_key_invalid", request, logging.WARNING)
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+# apply to all conversion routers:
+# app.include_router(router, dependencies=[Depends(require_api_key)])
+```
+An API key shipped inside browser JavaScript is **not secret**. Use B for server-to-server calls, and A (rate limits +
+CAPTCHA) for a public frontend.
+
+Whichever you choose: never expose directory listings (`StaticFiles` over `uploads/`, `converted_files/`
+or `outputs/` is a data leak), and never serve files by a path the client supplies.
 
 ### 3.4 Validate uploads (you already have `file_type.py` and `image_validation.py`)
 
 - Enforce a max size and allowed extensions **and** check magic bytes, not just the extension.
-- Save to disk under a **server-generated name** (`uuid4().hex + ext`). Never use the client filename in a path.
+- Save under a **server-generated name** (`uuid4().hex + ext`). Never use the client filename in a path.
 - Limit pixel count and page count to stop decompression bombs:
 
 ```python
@@ -233,7 +257,7 @@ Image.MAX_IMAGE_PIXELS = 100_000_000   # raises DecompressionBombError above thi
 ### 3.5 Run external tools safely and with limits
 
 ```python
-import subprocess, uuid, shutil, tempfile
+import subprocess, uuid, shutil
 
 profile = f"/tmp/lo_{uuid.uuid4().hex}"           # separate LibreOffice profile per job
 try:
@@ -260,9 +284,8 @@ consider a CAPTCHA, because open contact forms get used to spam.
 
 ```bash
 pip install pip-audit && pip-audit -r requirements.txt
-cd go-auth && go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck ./...
 ```
-Pin versions in `requirements.txt` and re-run these monthly.
+Pin versions in `requirements.txt` and re-run this monthly.
 
 ---
 
@@ -347,7 +370,7 @@ sudo ufw status verbose
 Also in **hPanel → VPS → Security → Firewall**, create a rule set: allow TCP 22, 80, 443 and drop the rest,
 and attach it to your VPS. Restrict port 22 to your own IP if it's static.
 
-> **Docker bypasses UFW** for any port it *publishes*. That's why every published port in this guide is bound
+> **Docker bypasses UFW** for any port it *publishes*. That's why the published port in this guide is bound
 > to `127.0.0.1:` (never `"8000:8000"`).
 
 ### 5.3 fail2ban (bans IPs that brute-force)
@@ -373,6 +396,7 @@ EOF
 sudo systemctl enable --now fail2ban
 sudo fail2ban-client status sshd
 ```
+Nginx-related jails and ban alerts are added in section 11.7.
 
 ### 5.4 Automatic security updates
 
@@ -394,7 +418,7 @@ net.ipv4.icmp_echo_ignore_broadcasts = 1
 EOF
 sudo sysctl --system
 
-# Intrusion/rootkit checks (optional but cheap)
+# Auditing + rootkit checks (configured in section 11)
 sudo apt install -y auditd rkhunter
 ```
 
@@ -439,8 +463,8 @@ sudo usermod -aG docker deploy   # log out and back in afterwards
 sudo mkdir -p /opt/converter && sudo chown deploy:deploy /opt/converter
 cd /opt/converter
 git clone git@github.com:YOUR_USER/YOUR_REPO.git .    # use a read-only deploy key for private repos
-mkdir -p data/uploads data/converted_files data/outputs data/models data/pgdata data/logs
-sudo chown -R 1000:1000 data/uploads data/converted_files data/outputs data/models data/logs   # container user UID
+mkdir -p data/uploads data/converted_files data/outputs data/models data/logs
+sudo chown -R 1000:1000 data     # container user UID
 ```
 
 ### 7.2 Secrets (`.env`)
@@ -449,44 +473,23 @@ Use the variable names from your own `example_env`. These are typical values:
 
 ```bash
 cp example_env .env
-cp go-auth/example_env go-auth/.env
-chmod 600 .env go-auth/.env
-
-openssl rand -hex 32        # run for JWT_SECRET
-openssl rand -base64 24     # run for DB password
+chmod 600 .env
+openssl rand -hex 32        # use for API keys (section 3.3-B), if you use them
 ```
-
-`.env` (root):
 
 ```env
 APP_ENV=production
 DEBUG=false
 ALLOWED_ORIGINS=https://example.com,https://www.example.com
-JWT_SECRET=<generated 64 hex chars>
 MAX_UPLOAD_MB=50
-
-POSTGRES_USER=converter
-POSTGRES_PASSWORD=<generated>
-POSTGRES_DB=converter_auth
+LOG_DIR=/app/logs
+API_KEYS=web:<generated>,partner:<generated>     # optional, only if you use section 3.3-B
+# SMTP settings for the contact form (from example_env)
 ```
 
-`go-auth/.env` (same `JWT_SECRET`, DB host is the compose service name `db`):
+Never commit `.env`.
 
-```env
-APP_ENV=production
-PORT=8080
-JWT_SECRET=<same value as above>
-DB_HOST=db
-DB_PORT=5432
-DB_USER=converter
-DB_PASSWORD=<same as POSTGRES_PASSWORD>
-DB_NAME=converter_auth
-# SMTP settings for go-auth/services/email.go
-```
-
-Never commit these files. If your Go code falls back to a default JWT secret when the variable is missing, remove that fallback so the app refuses to start instead.
-
-### 7.3 `Dockerfile` for FastAPI
+### 7.3 `Dockerfile`
 
 Adapt your existing Dockerfile or use this:
 
@@ -528,23 +531,7 @@ is safe here only because the port is published on loopback and reached only thr
 `Procfile`: if it defines a separate worker process (`app/worker.py`), add a second `worker` service in compose
 using the same image and that command.
 
-### 7.4 `go-auth/Dockerfile`
-
-```dockerfile
-FROM golang:1.22-alpine AS build          # match the version in go-auth/go.mod
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /auth .
-
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /auth /auth
-EXPOSE 8080
-ENTRYPOINT ["/auth"]
-```
-
-### 7.5 `docker-compose.yml` (project root)
+### 7.4 `docker-compose.yml` (project root)
 
 ```yaml
 services:
@@ -577,45 +564,9 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-    depends_on:
-      - auth
-
-  auth:
-    build: ./go-auth
-    container_name: converter-auth
-    restart: unless-stopped
-    env_file: ./go-auth/.env
-    ports:
-      - "127.0.0.1:8080:8080"
-    security_opt:
-      - no-new-privileges:true
-    cap_drop: [ALL]
-    read_only: true
-    mem_limit: 256m
-    depends_on:
-      db:
-        condition: service_healthy
-
-  db:
-    image: postgres:16-alpine
-    container_name: converter-db
-    restart: unless-stopped
-    env_file: .env
-    volumes:
-      - ./data/pgdata:/var/lib/postgresql/data
-    # no "ports:" — the database is reachable only from other containers
-    security_opt:
-      - no-new-privileges:true
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 ```
 
-If your auth service uses another database, replace the `db` service accordingly. Add a `worker:` service if your Procfile has one.
-
-### 7.6 Start it
+### 7.5 Start it
 
 ```bash
 docker compose build
@@ -646,7 +597,6 @@ server_tokens off;
 # Rate-limit zones (per client IP)
 limit_req_zone  $binary_remote_addr zone=api:10m    rate=10r/s;
 limit_req_zone  $binary_remote_addr zone=upload:10m rate=30r/m;
-limit_req_zone  $binary_remote_addr zone=auth:10m   rate=5r/m;
 limit_conn_zone $binary_remote_addr zone=perip:10m;
 limit_req_status 429;
 
@@ -729,6 +679,11 @@ server {
 
     include snippets/security-headers.conf;
 
+    # Logs (section 11.5)
+    access_log /var/log/nginx/converter_access.log;                    # classic format (fail2ban reads this)
+    access_log /var/log/nginx/converter_access.json.log json_combined; # JSON (for jq / dashboards)
+    error_log  /var/log/nginx/converter_error.log warn;
+
     # Max upload size — keep equal to MAX_UPLOAD_MB in .env
     client_max_body_size 50m;
     client_body_timeout  60s;
@@ -743,15 +698,7 @@ server {
     # Readiness details are for the server's own health script only
     location = /ready { return 404; }
 
-    # Go auth service — strict rate limit against password guessing.
-    # Match the prefix to the routes in go-auth/routes/routes.go.
-    location /auth/ {
-        limit_req zone=auth burst=5 nodelay;
-        proxy_pass http://127.0.0.1:8080/;
-        include snippets/proxy-common.conf;
-    }
-
-    # Conversion/upload endpoints
+    # Conversion/upload endpoints (adjust the pattern to your real routes)
     location ~ ^/api/.*(convert|upload|editor) {
         limit_req zone=upload burst=10 nodelay;
         proxy_pass http://127.0.0.1:8000;
@@ -786,39 +733,35 @@ proxy_set_header X-Request-ID      $request_id;
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Adjust the `location` regexes to your real route prefixes (see `app/api/routes.py` and `app/api/routers/`).
-Frontend API URL in `frontend/js/config.js` should be `https://example.com`.
+Adjust the `location` regex to your real route prefixes (see `app/api/routes.py` and `app/api/routers/`).
+The frontend API URL in `frontend/js/config.js` should be `https://example.com`.
 
 ---
 
-## 9. Application-level security
-
-Summary of what protects you at each layer:
+## 9. Security layers summary
 
 | Layer | Protection |
 |---|---|
-| Network | Hostinger firewall + UFW (22/80/443 only), fail2ban, loopback-only app ports |
+| Network | Hostinger firewall + UFW (22/80/443 only), fail2ban, loopback-only app port |
 | TLS | Let's Encrypt, TLS 1.2+, HSTS, auto-renewal |
-| Nginx | Rate limits (general / upload / auth), body-size limit, timeouts, hidden-file blocking, headers |
-| Containers | Non-root user, all capabilities dropped, `no-new-privileges`, memory/CPU/PID limits, DB not published |
-| App | JWT verification everywhere, CORS allow-list, docs disabled, TrustedHost, upload validation, SSRF guard, tool timeouts |
-| Data | Random filenames, auto-delete of old files, `.env` mode 600, backups |
-| Monitoring | JSON audit logs, login / unauthorized-access tracking, SSH-login alerts, fail2ban, health checks, daily report (section 11) |
+| Nginx | Rate limits (general / upload), body-size limit, timeouts, hidden-file blocking, headers |
+| Container | Non-root user, all capabilities dropped, `no-new-privileges`, memory/CPU/PID limits |
+| App | CORS allow-list, docs disabled, TrustedHost, access control (rate limits/CAPTCHA or API key), upload validation, SSRF guard, tool timeouts |
+| Data | Random filenames, auto-delete of old files, `.env` mode 600, config backups |
+| Monitoring | JSON audit logs, unauthorized-access tracking, SSH-login alerts, fail2ban, health checks, daily report (section 11) |
 
 Extra recommendations:
 
-- **Egress filtering** (advanced): since the app fetches URLs, block the containers from reaching the host's
-  private network, e.g. `sudo iptables -I DOCKER-USER -d 10.0.0.0/8 -j DROP` (repeat for `172.16.0.0/12`,
-  `192.168.0.0/16`, `169.254.0.0/16`). Do this in addition to the SSRF code check. Persist rules with `iptables-persistent`.
+- **Egress filtering** (advanced): since the app fetches URLs, block the container from reaching private networks, e.g.
+  `sudo iptables -I DOCKER-USER -d 10.0.0.0/8 -j DROP` (repeat for `172.16.0.0/12`, `192.168.0.0/16`,
+  `169.254.0.0/16`). Do this in addition to the SSRF code check. Persist rules with `iptables-persistent`.
 - **Cloudflare (free plan)** in front of the domain adds DDoS protection and bot filtering. If you enable the
   proxy, restrict ports 80/443 on the VPS to Cloudflare's IP ranges and use their real-IP header.
-- **Password rules / login lockout** in `go-auth/handlers/auth.go`: hash with bcrypt/argon2, add a delay or
-  lockout after repeated failures, short-lived access tokens (15–60 min), verify email before activation.
-- **Do not log** tokens, passwords or full file contents.
+- **Do not log** secrets, API keys or file contents.
 
 ---
 
-## 10. Cleanup, backups, logs, monitoring
+## 10. Cleanup & backups
 
 ### 10.1 Delete old user files automatically
 
@@ -832,61 +775,50 @@ sudo tee /etc/cron.d/converter-cleanup >/dev/null <<'EOF'
 EOF
 ```
 
-### 10.2 Database backup (daily, keep 7 days)
+### 10.2 Backups
+
+This service is stateless: uploads and results are temporary by design, so there's no database to dump. What you
+need to be able to rebuild is the **code** (in Git) and the **configuration**:
 
 ```bash
 sudo mkdir -p /opt/backups && sudo chown deploy:deploy /opt/backups
 cat > /opt/converter/backup.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-cd /opt/converter
-STAMP=$(date +%F_%H%M)
-docker compose exec -T db sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' | gzip > /opt/backups/db_$STAMP.sql.gz
-find /opt/backups -name 'db_*.sql.gz' -mtime +7 -delete
+STAMP=$(date +%F)
+sudo tar czf /opt/backups/config_$STAMP.tar.gz \
+  /opt/converter/.env /opt/converter/docker-compose.yml \
+  /etc/nginx/conf.d /etc/nginx/sites-available /etc/nginx/snippets \
+  /etc/fail2ban/jail.d /etc/fail2ban/jail.local /etc/fail2ban/filter.d /etc/fail2ban/action.d \
+  /etc/cron.d /etc/audit/rules.d /etc/converter-alerts.env /usr/local/bin/*.sh 2>/dev/null
+find /opt/backups -name 'config_*.tar.gz' -mtime +14 -delete
 EOF
 chmod 700 /opt/converter/backup.sh
-( crontab -l 2>/dev/null; echo "30 3 * * * /opt/converter/backup.sh" ) | crontab -
+( crontab -l 2>/dev/null; echo "30 3 * * 0 /opt/converter/backup.sh" ) | crontab -   # weekly (needs passwordless sudo for tar, or run from root's crontab)
 ```
 
-Copy backups **off the server** too (Hostinger snapshots, `rclone` to S3/Backblaze, or `rsync` to another machine).
-A backup stored only on the same VPS is lost along with the VPS. Restore test:
-`gunzip -c db_XXXX.sql.gz | docker compose exec -T db psql -U converter converter_auth`.
-
-### 10.3 Quick log commands
-
-(The full monitoring, alerting and audit setup is in [section 11](#11-monitoring-logging-auditing--alerting).)
-
-```bash
-docker compose logs --tail=100 -f api auth     # app logs
-sudo tail -f /var/log/nginx/access.log /var/log/nginx/error.log
-sudo fail2ban-client status sshd               # banned IPs
-sudo journalctl -u ssh --since today | grep -i failed
-docker stats                                   # CPU/RAM per container
-df -h && free -h                               # disk and memory
-```
-
-Set up a free external uptime monitor (UptimeRobot / Better Stack) on `https://example.com/health` with email alerts.
+The archive contains secrets (`.env`), so store it encrypted or only in a private location. Copy it **off the server**
+(`rclone` to S3/Backblaze, or download it) and keep **Hostinger snapshots** enabled. A backup that only lives on the
+same VPS is lost along with the VPS.
 
 ---
 
 ## 11. Monitoring, Logging, Auditing & Alerting
 
-Goal: you should know **who logged in, who failed to log in, who tried to access something they shouldn't,
-what each user did, whether every service is healthy, and be alerted on your phone within a minute**, not
-discover it a week later.
+Goal: you should know **who accessed the server, who tried to access something they shouldn't, what each request
+did, whether the service is healthy, and be alerted on your phone within a minute**, not discover it a week later.
 
 ### 11.1 What you'll have
 
 | What | Where it is recorded | Alert? |
 |---|---|---|
-| Every API request, user, IP, status, duration | FastAPI audit log (`data/logs/audit.log`) + Nginx JSON log | 5xx / 401 / 403 spikes |
-| Login success / failure, register, password reset | Go auth service logs (JSON) + Nginx log | Brute-force bans |
-| Unauthorized access (401/403), bad tokens, forbidden file access | Audit log, Nginx log | Yes (fail2ban + spike check) |
-| Uploads, conversions, downloads, deletes, rejected files, SSRF blocks | Audit log | SSRF/rejected: review daily |
+| Every API request: IP, status, duration (and API-key name, if used) | FastAPI audit log (`data/logs/audit.log`) + Nginx JSON log | 5xx / 401 / 403 spikes |
+| Unauthorized access (401/403), invalid API keys, forbidden file access | Audit log, Nginx log | Yes (fail2ban + spike check) |
+| Uploads, conversions, downloads, rejected files, SSRF blocks | Audit log | Review daily |
 | SSH logins (success + failed), `sudo` use | `journalctl`, `auditd`, PAM hook | **Every SSH login** |
-| Changes to critical files (`.env`, SSH keys, sudoers, nginx, cron) | `auditd` | Review / `ausearch` |
+| Changes to critical files (`.env`, SSH keys, sudoers, nginx, cron) | `auditd` | Review via `ausearch` |
 | Banned IPs | fail2ban | **Every ban** |
-| Service health (site, API, auth, DB, nginx, firewall) | `healthcheck.sh` every minute | **Down / recovered** |
+| Service health (site, API, container, nginx, firewall) | `healthcheck.sh` every minute | **Down / recovered** |
 | Disk, RAM, TLS certificate expiry | `healthcheck.sh` | Yes |
 | Summary of the last 24 h | Daily report | Telegram message |
 | Server dead / internet outage | External uptime monitor + heartbeat | Yes |
@@ -974,7 +906,7 @@ def client_ip(request: Request) -> str:
 def audit_event(event: str, request: Request | None = None, level: int = logging.INFO, **fields):
     if request is not None:
         fields.setdefault("ip", client_ip(request))
-        fields.setdefault("user", getattr(request.state, "user_id", None))
+        fields.setdefault("user", getattr(request.state, "user_id", None))   # API-key name if you use 3.3-B
         fields.setdefault("request_id", getattr(request.state, "request_id", None))
     audit.log(level, event, extra={"fields": fields})
 ```
@@ -1005,27 +937,14 @@ async def activity_log(request: Request, call_next):
         elif status == 429:       event, level = "rate_limited", logging.WARNING
         elif status >= 500:       event, level = "server_error", logging.ERROR
         audit_event(event, request, level,
-                    method=request.method, path=request.url.path,   # path only; never log query strings (tokens)
+                    method=request.method, path=request.url.path,   # path only; never log query strings
                     status=status, ms=round((time.perf_counter() - start) * 1000),
                     ua=request.headers.get("user-agent", "")[:120])
     response.headers["X-Request-ID"] = rid
     return response
 ```
 
-**Record who the user is** in your JWT dependency, and log bad tokens:
-
-```python
-def get_current_user(request: Request, token: str = Depends(bearer)):
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])   # use your real decode logic
-    except Exception:
-        audit_event("token_invalid", request, logging.WARNING)
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    request.state.user_id = payload["sub"]
-    return payload
-```
-
-**Add business events** in the routers and converters (use the names below so searching is easy):
+**Add business events** in the routers and converters (use these names so searching is easy):
 
 ```python
 audit_event("file_uploaded", request, kind="pdf_to_word", ext=ext, size=size)       # no file names/content
@@ -1033,11 +952,15 @@ audit_event("upload_rejected", request, logging.WARNING, reason="bad_magic_bytes
 audit_event("conversion_done", request, job_id=job_id, kind="pdf_to_pptx", ms=elapsed_ms)
 audit_event("conversion_failed", request, logging.ERROR, job_id=job_id, error=type(e).__name__)
 audit_event("file_downloaded", request, job_id=job_id)
-audit_event("forbidden_file_access", request, logging.WARNING, job_id=job_id)       # job belongs to someone else
+audit_event("forbidden_file_access", request, logging.WARNING, job_id=job_id)       # job not owned by caller
 audit_event("ssrf_blocked", request, logging.WARNING, host=host)                    # from assert_public_url()
+audit_event("contact_form_sent", request)
 ```
 
-Also add the `/ready` readiness endpoint (detailed dependency check, used by the health script in 11.8):
+(If you ever add user login to this app, set `request.state.user_id` after verifying the user, and log
+`login_success` / `login_failed` events the same way. They'll then appear in all reports below.)
+
+Add a `/ready` readiness endpoint (detailed dependency check, used by the health script in 11.8):
 
 ```python
 import os, shutil
@@ -1056,66 +979,12 @@ def ready():
 ```
 Nginx returns 404 for `/ready` from outside (section 8.3); only the server itself can call it.
 
-Add a `/health` route to the Go service as well (return 200 after a quick DB ping) so it can be checked too.
+### 11.4 Nginx access logs (JSON + request IDs)
 
-### 11.4 Auth service logging (Go): logins and failures
-
-Create `go-auth/utils/audit.go`:
-
-```go
-package utils
-
-import (
-	"crypto/sha256"
-	"encoding/hex"
-	"log/slog"
-	"os"
-	"strings"
-)
-
-func InitLogger() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
-}
-
-// HashID lets you correlate events per user without writing the email into the logs.
-func HashID(s string) string {
-	h := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(s))))
-	return hex.EncodeToString(h[:6])
-}
-```
-
-Call `utils.InitLogger()` at the start of `main()`, then log in `handlers/auth.go`
-(`ip` = the `X-Real-IP` header that Nginx sets; with Gin: `c.GetHeader("X-Real-IP")`):
-
-```go
-slog.Info("login_success",  "user", utils.HashID(email), "ip", ip)
-slog.Warn("login_failed",   "user", utils.HashID(email), "ip", ip, "reason", "bad_password")  // or "unknown_user"
-slog.Warn("account_locked", "user", utils.HashID(email), "ip", ip)
-slog.Info("register",       "user", utils.HashID(email), "ip", ip)
-slog.Info("password_reset_requested", "user", utils.HashID(email), "ip", ip)
-slog.Info("password_changed", "user", userID, "ip", ip)
-slog.Warn("token_invalid",  "ip", ip, "reason", "expired")      // in middleware/jwt.go
-```
-**Never log passwords, tokens or reset links.** Use the same message for "wrong password" and "unknown user" in the
-HTTP response (no user enumeration), but keep the distinct `reason` in the log.
-
-Read them with `docker compose logs auth | grep login_failed`.
-
-### 11.5 Nginx access logs (JSON + request IDs)
-
-The JSON `log_format` was added in section 8.1 and the request-ID header in `proxy-common.conf`. Enable the logs
-in the HTTPS `server {}` block of `/etc/nginx/sites-available/converter` (next to `include snippets/security-headers.conf;`):
-
-```nginx
-    access_log /var/log/nginx/converter_access.log;                    # classic format (fail2ban reads this)
-    access_log /var/log/nginx/converter_access.json.log json_combined; # JSON (for jq / dashboards)
-    error_log  /var/log/nginx/converter_error.log warn;
-```
-```bash
-sudo nginx -t && sudo systemctl reload nginx
-```
-The same `X-Request-ID` appears in Nginx logs, the app's audit log and the response header, so one request
-can be traced end to end. Never put tokens in URLs/query strings, because the classic log records them.
+The JSON `log_format` is in section 8.1, the `access_log` lines are in the site config (8.3), and the request-ID header
+is in `proxy-common.conf`. The same `X-Request-ID` appears in the Nginx log, the app's audit log and the response
+header, so one request can be traced end to end. Never put secrets in URLs/query strings, because the classic
+log records them.
 
 Keep 30 days of Nginx logs:
 
@@ -1123,7 +992,7 @@ Keep 30 days of Nginx logs:
 sudo sed -i 's/rotate 14/rotate 30/' /etc/logrotate.d/nginx
 ```
 
-### 11.6 Server logins, sudo and file-change auditing
+### 11.5 Server logins, sudo and file-change auditing
 
 **Instant alert on every SSH login (and `sudo`)**. You'll see immediately if someone else gets in:
 
@@ -1157,7 +1026,6 @@ sudo tee /etc/audit/rules.d/converter.rules >/dev/null <<'EOF'
 -w /home/deploy/.ssh/ -p wa -k ssh_keys
 -w /root/.ssh/ -p wa -k ssh_keys
 -w /opt/converter/.env -p wa -k app_secrets
--w /opt/converter/go-auth/.env -p wa -k app_secrets
 -w /opt/converter/docker-compose.yml -p wa -k app_config
 -w /etc/nginx/ -p wa -k nginx_conf
 -w /etc/docker/ -p wa -k docker_conf
@@ -1172,9 +1040,9 @@ sudo auditctl -l | head
 Query it:
 
 ```bash
-sudo ausearch -k ssh_keys -ts today -i        # who touched SSH keys
-sudo ausearch -k root_commands -ts today -i | tail -50   # commands run as root via sudo
-sudo aureport --auth --summary                # authentication summary
+sudo ausearch -k ssh_keys -ts today -i                    # who touched SSH keys
+sudo ausearch -k root_commands -ts today -i | tail -50    # commands run as root via sudo
+sudo aureport --auth --summary                            # authentication summary
 ```
 
 **Login history commands:**
@@ -1187,19 +1055,19 @@ sudo journalctl -u ssh --since today | grep -E "Accepted|Failed|Invalid user"
 sudo journalctl _COMM=sudo --since today    # sudo activity
 ```
 
-### 11.7 Automatic blocking and alerts (fail2ban for Nginx + app)
-
-Filters (`/etc/fail2ban/filter.d/`):
+### 11.6 Journal retention
 
 ```bash
-# Repeated failed logins/registration/reset on the auth service (adjust the path to your routes)
-sudo tee /etc/fail2ban/filter.d/nginx-auth-fail.conf >/dev/null <<'EOF'
-[Definition]
-failregex = ^<HOST> - \S+ \[[^\]]+\] "(POST|PUT) /auth/\S*(login|register|forgot|reset)\S* HTTP/[\d.]+" (401|403|429)
-ignoreregex =
-EOF
+sudo mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=1G\nMaxRetentionSec=90day\n' | sudo tee /etc/systemd/journald.conf.d/size.conf
+sudo systemctl restart systemd-journald
+```
 
-# Floods of 401/403 on any URL (token guessing, endpoint probing)
+### 11.7 Automatic blocking and alerts (fail2ban for Nginx)
+
+Filter (`/etc/fail2ban/filter.d/`) for floods of 401/403 on any URL (API-key guessing, endpoint probing):
+
+```bash
 sudo tee /etc/fail2ban/filter.d/nginx-unauthorized.conf >/dev/null <<'EOF'
 [Definition]
 failregex = ^<HOST> - \S+ \[[^\]]+\] "[A-Z]+ [^"]*" (401|403) 
@@ -1207,7 +1075,7 @@ ignoreregex =
 EOF
 ```
 
-Alert action:
+Alert action (sends a Telegram message on every ban):
 
 ```bash
 sudo tee /etc/fail2ban/action.d/telegram.conf >/dev/null <<'EOF'
@@ -1227,15 +1095,6 @@ sudo tee /etc/fail2ban/jail.d/10-converter.local >/dev/null <<'EOF'
 [DEFAULT]
 action = %(action_)s
          telegram
-
-[nginx-auth-fail]
-enabled  = true
-port     = http,https
-filter   = nginx-auth-fail
-logpath  = /var/log/nginx/converter_access.log
-maxretry = 5
-findtime = 10m
-bantime  = 2h
 
 [nginx-unauthorized]
 enabled  = true
@@ -1262,25 +1121,25 @@ maxretry = 3
 bantime  = 1d
 EOF
 
-# Test the patterns against real logs (should report "matched" lines after some failed logins)
-sudo fail2ban-regex /var/log/nginx/converter_access.log /etc/fail2ban/filter.d/nginx-auth-fail.conf
+# Test the pattern against real logs
+sudo fail2ban-regex /var/log/nginx/converter_access.log /etc/fail2ban/filter.d/nginx-unauthorized.conf
 sudo systemctl restart fail2ban
 sudo fail2ban-client status
-sudo fail2ban-client status nginx-auth-fail
 ```
 
-Useful: `sudo fail2ban-client set <jail> unbanip <IP>` (if you ban yourself), `sudo fail2ban-client banned`.
+`nginx-limit-req` bans clients who keep hitting your rate limits (abusive upload spam). Useful commands:
+`sudo fail2ban-client set <jail> unbanip <IP>` (if you ban yourself), `sudo fail2ban-client banned`.
 Add your own static IP to `ignoreip` in `[DEFAULT]` if you test a lot.
 
 ### 11.8 Health checking
 
 Three layers:
 
-1. **Container health** — `healthcheck:` in compose (already added) marks `converter-api` as `healthy/unhealthy`
+1. **Container health**: the `healthcheck:` in compose marks `converter-api` as `healthy/unhealthy`
    (`docker ps`, `docker inspect`).
-2. **Server-side checker (every minute)**: checks the public site, readiness, each container, nginx, fail2ban, UFW,
+2. **Server-side checker (every minute)**: checks the public site, readiness, the container, nginx, fail2ban, UFW,
    disk, RAM, certificate expiry, and 5xx / 401-403 spikes. It alerts **once** when a problem starts and
-   once when it recovers (no spam), and restarts unhealthy containers.
+   once when it recovers (no spam), and restarts the container if Docker reports it unhealthy.
 3. **External monitor**: sees the outage when the whole server is down.
 
 `/usr/local/bin/healthcheck.sh`:
@@ -1316,27 +1175,22 @@ ufw_ok()     { ufw status | grep -q "Status: active"; }
 err5xx_ok()  { [ "$(tail -n 1000 "$LOG" | awk '$9>=500' | wc -l)" -lt 20 ]; }
 unauth_ok()  { [ "$(tail -n 1000 "$LOG" | awk '$9==401||$9==403' | wc -l)" -lt 100 ]; }
 
-check site   "Website https://$DOMAIN/health is DOWN"           site_ok
-check ready  "API readiness failing (soffice/gs/tesseract/disk)" curl -fs -m 10 http://127.0.0.1:8000/ready
-check auth   "Auth service /health failing"                      curl -fs -m 10 http://127.0.0.1:8080/health
-for c in converter-api converter-auth converter-db; do
-  check "c_$c" "Container $c is not running / unhealthy" container_ok "$c"
-done
-check nginx  "nginx is not running"      systemctl is-active --quiet nginx
-check f2b    "fail2ban is not running"   systemctl is-active --quiet fail2ban
-check ufw    "UFW firewall is NOT active" ufw_ok
-check disk   "Disk usage above 85%"      disk_ok
-check mem    "Available RAM below 10%"   mem_ok
+check site   "Website https://$DOMAIN/health is DOWN"            site_ok
+check ready  "API readiness failing (soffice/gs/tesseract/disk)"  curl -fs -m 10 http://127.0.0.1:8000/ready
+check api    "Container converter-api is not running / unhealthy" container_ok converter-api
+check nginx  "nginx is not running"        systemctl is-active --quiet nginx
+check f2b    "fail2ban is not running"     systemctl is-active --quiet fail2ban
+check ufw    "UFW firewall is NOT active"  ufw_ok
+check disk   "Disk usage above 85%"        disk_ok
+check mem    "Available RAM below 10%"     mem_ok
 check cert   "TLS certificate expires in < 14 days (renewal failing?)" cert_ok
-check e5xx   "Spike of 5xx errors (≥20 in last 1000 requests)"        err5xx_ok
+check e5xx   "Spike of 5xx errors (≥20 in last 1000 requests)"         err5xx_ok
 check eauth  "Spike of 401/403 (≥100 in last 1000 requests): possible attack" unauth_ok
 
-# Auto-heal: restart containers Docker reports as unhealthy
-for c in converter-api; do
-  if [ "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null)" = "unhealthy" ]; then
-    docker restart "$c" >/dev/null && alert "♻️ Restarted unhealthy container $c"
-  fi
-done
+# Auto-heal: restart the container if Docker reports it unhealthy
+if [ "$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' converter-api 2>/dev/null)" = "unhealthy" ]; then
+  docker restart converter-api >/dev/null && alert "♻️ Restarted unhealthy container converter-api"
+fi
 
 # Dead-man's switch: external service alerts you if these pings STOP (server or cron dead)
 [ -n "${HEARTBEAT_URL:-}" ] && curl -fsS -m 10 "$HEARTBEAT_URL" >/dev/null 2>&1
@@ -1348,15 +1202,15 @@ echo '* * * * * root /usr/local/bin/healthcheck.sh' | sudo tee /etc/cron.d/conve
 sudo /usr/local/bin/healthcheck.sh && echo "ran OK"
 ```
 
-Test an alert: `docker stop converter-auth`. Within about a minute you get "PROBLEM", then start it again and you
-get "RECOVERED". (If you have not added the Go `/health` route yet, the `auth` check will alert until you do.)
-The 5xx and 401/403 checks are rough heuristics that look at the last 1000 requests. Tune the numbers to your traffic.
+Test an alert: `docker stop converter-api`. Within about a minute you get "PROBLEM", then start it again
+(`docker start converter-api`) and you get "RECOVERED". The 5xx and 401/403 checks are rough heuristics that look at
+the last 1000 requests, so tune the numbers to your traffic.
 
 **External monitors (free tiers: UptimeRobot, Better Stack, healthchecks.io)**: set up:
 
 - HTTPS monitor on `https://example.com/health` (alerts if the server, Nginx or the app is unreachable)
 - SSL-expiry monitor
-- A **heartbeat/cron monitor** → paste its URL into `HEARTBEAT_URL` in `/etc/converter-alerts.env`. The server pings it
+- A **heartbeat/cron monitor**: paste its URL into `HEARTBEAT_URL` in `/etc/converter-alerts.env`. The server pings it
   every minute; if pings stop, you're alerted even if the VPS is completely dead.
 
 ### 11.9 Daily activity report
@@ -1367,19 +1221,20 @@ sudo apt install -y jq goaccess
 sudo tee /usr/local/bin/daily-report.sh >/dev/null <<'EOF'
 #!/usr/bin/env bash
 LOG=/var/log/nginx/converter_access.log
+APPLOG=/opt/converter/data/logs/audit.log
 Y=$(date -d yesterday +%d/%b/%Y)
 LINES=$(zcat -f "$LOG" "$LOG.1" 2>/dev/null | grep "\[$Y")
-cnt() { echo "$LINES" | awk -v c="$1" "$2" | wc -l; }
-APPLOG=/opt/converter/data/logs/audit.log
+cnt() { echo "$LINES" | awk "$1" | wc -l; }
+ev() { grep -c "\"msg\": \"$1\"" "$APPLOG" 2>/dev/null || echo 0; }
 
 REPORT="📊 Daily report $(hostname) — $Y
 Requests: $(echo "$LINES" | grep -c .)
-401/403: $(cnt x '$9==401||$9==403')   429: $(cnt x '$9==429')   5xx: $(cnt x '$9>=500')
+401/403: $(cnt '$9==401||$9==403')   429: $(cnt '$9==429')   5xx: $(cnt '$9>=500')
 SSH accepted: $(journalctl -u ssh --since yesterday --until today 2>/dev/null | grep -c 'Accepted')
 SSH failed/invalid: $(journalctl -u ssh --since yesterday --until today 2>/dev/null | grep -cE 'Failed password|Invalid user')
 Currently banned (sshd): $(fail2ban-client status sshd 2>/dev/null | awk -F: '/Currently banned/{print $2}')
-App events: logins failed=$(docker compose -f /opt/converter/docker-compose.yml logs --since 24h auth 2>/dev/null | grep -c login_failed), \
-ssrf_blocked=$(grep -c ssrf_blocked "$APPLOG" 2>/dev/null), upload_rejected=$(grep -c upload_rejected "$APPLOG" 2>/dev/null)
+App events (all time in current log): conversions=$(ev conversion_done) failed=$(ev conversion_failed) \
+rejected_uploads=$(ev upload_rejected) ssrf_blocked=$(ev ssrf_blocked) unauthorized=$(ev unauthorized_access)
 Disk: $(df -h / | awk 'NR==2{print $5}')  RAM free: $(free -h | awk '/Mem:/{print $7}')
 Top IPs:
 $(echo "$LINES" | awk '{print $1}' | sort | uniq -c | sort -rn | head -5)"
@@ -1393,12 +1248,12 @@ echo '0 8 * * * root /usr/local/bin/daily-report.sh' | sudo tee /etc/cron.d/conv
 
 ```bash
 sudo goaccess /var/log/nginx/converter_access.log --log-format=COMBINED   # interactive traffic dashboard in the terminal
-docker stats                                                               # live CPU/RAM per container
+docker stats                                                               # live CPU/RAM of the container
 sudo apt install -y lynis && sudo lynis audit system                       # server hardening score + suggestions (monthly)
 sudo rkhunter --update && sudo rkhunter --check --sk                       # rootkit scan (monthly)
 ```
 
-If you want graphs (CPU, RAM, disk, per-container), install **Netdata** or **Grafana + Prometheus**, but **never expose
+If you want graphs (CPU, RAM, disk), install **Netdata** or **Grafana + Prometheus**, but **never expose
 dashboards publicly**. Bind them to `127.0.0.1` and open them through an SSH tunnel:
 `ssh -L 19999:127.0.0.1:19999 deploy@SERVER_IP` → http://localhost:19999.
 
@@ -1406,36 +1261,27 @@ dashboards publicly**. Bind them to `127.0.0.1` and open them through an SSH tun
 
 | Log | Retention |
 |---|---|
-| Nginx access/error | 30 days (logrotate, set above) |
+| Nginx access/error | 30 days (logrotate, set in 11.4) |
 | App audit log | ~100 MB rotating (10 files × 10 MB), roughly weeks |
-| Docker container logs | 5 × 10 MB per container (daemon.json, section 6) |
-| systemd journal (SSH, sudo) | cap at 1 GB / 90 days (below) |
+| Docker container logs | 5 × 10 MB (daemon.json, section 6) |
+| systemd journal (SSH, sudo) | 1 GB / 90 days (11.6) |
 | auditd | `/var/log/audit` (default rotation); archive if you need more |
 
-```bash
-sudo mkdir -p /etc/systemd/journald.conf.d
-printf '[Journal]\nSystemMaxUse=1G\nMaxRetentionSec=90day\n' | sudo tee /etc/systemd/journald.conf.d/size.conf
-sudo systemctl restart systemd-journald
-```
-
-IP addresses and user IDs are personal data. Mention logging and the retention period in your privacy policy,
-keep logs readable only by root/`deploy` (`chmod 750 data/logs`), and **never** log passwords, tokens, full emails,
-or file contents. If logs must survive a server compromise, ship them off-box (Better Stack, Grafana Cloud/Loki, or
-`rclone` of `/opt/converter/data/logs` and `/var/log/nginx` to object storage). An attacker with root can edit local logs.
+IP addresses are personal data. Mention logging and the retention period in your privacy policy, keep logs
+readable only by root/`deploy` (`chmod 750 data/logs`), and **never** log API keys, passwords, or file contents.
+If logs must survive a server compromise, ship them off-box (Better Stack, Grafana Cloud/Loki, or `rclone` of
+`/opt/converter/data/logs` and `/var/log/nginx` to object storage). An attacker with root can edit local logs.
 
 ### 11.12 Investigation cheat sheet
 
 ```bash
 cd /opt/converter
 
-# Failed logins (auth service) and who/where
-docker compose logs --since 24h auth | grep login_failed | jq -r '[.time,.user,.ip,.reason]|@tsv' 2>/dev/null
-
 # All unauthorized access attempts recorded by the API
 jq -c 'select(.msg=="unauthorized_access")' data/logs/audit.log | tail -20
 
-# Everything one user did / everything one IP did
-jq -c 'select(.user=="USER_ID")' data/logs/audit.log | tail -50
+# Everything one API-key name / one IP did
+jq -c 'select(.user=="partner")' data/logs/audit.log | tail -50
 grep '^1.2.3.4 ' /var/log/nginx/converter_access.log | tail -50
 
 # Top IPs causing 401/403 and top requested paths
@@ -1443,7 +1289,7 @@ awk '$9==401||$9==403{print $1}' /var/log/nginx/converter_access.log | sort | un
 awk '{print $7}' /var/log/nginx/converter_access.log | sort | uniq -c | sort -rn | head
 
 # Suspicious events
-jq -c 'select(.msg|test("ssrf_blocked|upload_rejected|forbidden_file_access"))' data/logs/audit.log | tail -20
+jq -c 'select(.msg|test("ssrf_blocked|upload_rejected|forbidden_file_access|api_key_invalid"))' data/logs/audit.log | tail -20
 
 # Trace one request across Nginx + app via X-Request-ID
 grep REQUEST_ID data/logs/audit.log /var/log/nginx/converter_access.json.log
@@ -1462,16 +1308,16 @@ docker events --since 1h --until 0s                    # container start/stop/ex
 | Alert | Likely cause | Action |
 |---|---|---|
 | 🔐 SSH/sudo session you didn't start | Stolen key or password | Section 15 immediately; check `last -a`, `ausearch -k ssh_keys` |
-| 🚫 fail2ban ban (sshd / auth) | Brute-force bots (normal) | Nothing, unless bans are constant → consider restricting SSH to your IP |
-| Spike of 401/403 | Token guessing, scanner, broken frontend token | Check top IPs (11.12), ban/Cloudflare-block the IP; verify frontend isn't looping |
+| 🚫 fail2ban ban (sshd) | Brute-force bots (normal) | Nothing, unless bans are constant → restrict SSH to your IP in the firewall |
+| 🚫 ban (nginx jails) | Scanner, API-key guessing, upload spam | Check top IPs (11.12); add the IP to Cloudflare/Hostinger firewall if persistent |
+| Spike of 401/403 | Key guessing, scanner, broken client | Check top IPs; verify your own frontend isn't sending a wrong key in a loop |
 | Spike of 5xx | Bug, OOM, LibreOffice hang, bad deploy | `docker compose logs api`, `docker stats`, roll back (section 12) |
 | Container unhealthy / restarted | OOM (exit 137), crash loop | Lower concurrency, raise `mem_limit`, check logs |
 | Readiness failing | Missing tool, disk full | `docker compose exec api which soffice gs tesseract`, `df -h`, cleanup cron |
-| Disk > 85% | Uploads not cleaned, logs, Docker images | Check `du -sh data/* /var/log/*`, `docker system df`, `docker image prune -f` |
+| Disk > 85% | Uploads not cleaned, logs, Docker images | `du -sh data/* /var/log/*`, `docker system df`, `docker image prune -f` |
 | Certificate < 14 days | Renewal failing | `sudo certbot renew --dry-run`, check port 80 and `certbot.timer` |
 | UFW not active | Someone disabled it (or reboot issue) | Treat as suspicious: `sudo ufw enable`, check `ausearch`, `last` |
-| `ssrf_blocked` / `upload_rejected` events | Someone probing the converter | Identify the IP/user in the audit log; ban or disable the account |
-| "login_failed" burst for one user | Credential stuffing | Lock the account, force password reset, tighten auth rate limit |
+| `ssrf_blocked` / `upload_rejected` events | Someone probing the converter | Identify the IP in the audit log; ban it; review the SSRF guard |
 
 ---
 
@@ -1504,8 +1350,9 @@ git checkout <previous_commit_hash>
 docker compose build && docker compose up -d
 ```
 
-Monthly maintenance: `sudo apt update && sudo apt upgrade`, rebuild images to pick up base-image patches
-(`docker compose build --pull && docker compose up -d`), run `pip-audit` / `govulncheck`, review `fail2ban` and Nginx logs.
+Monthly maintenance: `sudo apt update && sudo apt upgrade`, rebuild the image to pick up base-image patches
+(`docker compose build --pull && docker compose up -d`), run `pip-audit`, run `lynis` and `rkhunter`, and review
+fail2ban bans, the daily reports and Nginx logs.
 
 ---
 
@@ -1522,21 +1369,24 @@ curl -s https://example.com/docs -o /dev/null -w "%{http_code}\n"   # should be 
 Test TLS at https://www.ssllabs.com/ssltest/ (aim for A/A+) and headers at https://securityheaders.com.
 
 **On the server:** `sudo ufw status`, `sudo ss -tulpn` (nothing but sshd, nginx on public addresses),
-`docker ps` (ports on `127.0.0.1` only).
+`docker ps` (port on `127.0.0.1` only).
 
 | Problem | Fix |
 |---|---|
 | 502 Bad Gateway | `docker compose ps` / `logs api`. Container crashed or still starting |
 | 413 Request Entity Too Large | Raise `client_max_body_size` in Nginx and `MAX_UPLOAD_MB` |
 | 504 on large conversions | Increase `proxy_read_timeout` and gunicorn `--timeout` |
-| `Permission denied` writing to `uploads/` | `sudo chown -R 1000:1000 data/uploads data/converted_files data/outputs data/models` |
+| `Permission denied` writing to `uploads/` or `logs/` | `sudo chown -R 1000:1000 data` |
 | LibreOffice fails / hangs | Needs writable `HOME` (`/home/app`) and `/tmp`; use a unique profile per job; check RAM with `docker stats` |
 | Container killed (exit 137) | Out of memory: raise `mem_limit`, lower worker count, limit concurrent conversions |
 | `rembg` downloads model on every start | Make sure `./data/models:/home/app/.u2net` is mounted and writable |
 | CORS error in browser | Add the exact origin (scheme + domain) to `ALLOWED_ORIGINS` |
-| Wrong client IP in logs | Check `X-Forwarded-For` handling and gunicorn `--forwarded-allow-ips` |
+| Wrong client IP in logs | Check Nginx `X-Real-IP` / `X-Forwarded-For` headers and gunicorn `--forwarded-allow-ips` |
+| `400 Invalid host header` | Add the host to `allowed_hosts` in `TrustedHostMiddleware` |
 | `read_only: true` breaks the app | Add the failing path to `tmpfs` or a volume, or disable it |
 | Certificate renewal fails | `sudo certbot renew --dry-run`; make sure port 80 is open |
+| No Telegram alerts | `sudo /usr/local/bin/notify.sh test`; check token/chat id in `/etc/converter-alerts.env` |
+| fail2ban jail won't start | `sudo fail2ban-client -t` and make sure the log file exists (reload nginx first) |
 | Locked out of SSH | hPanel → Browser terminal |
 
 ---
@@ -1552,33 +1402,31 @@ Test TLS at https://www.ssllabs.com/ssltest/ (aim for A/A+) and headers at https
 **Network & TLS**
 - [ ] DNS A records correct, certificate issued, `certbot renew --dry-run` passes
 - [ ] HTTP redirects to HTTPS, HSTS header present
-- [ ] `nmap` shows only 22/80/443; app and DB ports are loopback/internal only
+- [ ] `nmap` shows only 22/80/443; app port is loopback only
 
 **Application**
 - [ ] `APP_ENV=production`, `DEBUG=false`, `/docs` and `/openapi.json` return 404
-- [ ] Strong random `JWT_SECRET` (≥32 bytes) in both services; no default fallback in code
-- [ ] JWT verified on all conversion, editor and download routes; ownership checks on files
 - [ ] CORS limited to your domain; TrustedHost configured
+- [ ] Access control chosen (rate limits + CAPTCHA for public, or API keys for private); random job IDs
 - [ ] SSRF guard on URL/HTML fetching features
 - [ ] Upload size, type (magic bytes), pixel and page limits enforced; server-generated filenames
 - [ ] Timeouts on every subprocess; concurrency limited
-- [ ] Rate limits on login, upload and contact endpoints
+- [ ] Rate limits on upload and contact endpoints
 
 **Monitoring & alerting**
 - [ ] Telegram (or other) alert channel tested with `notify.sh`
-- [ ] Audit log middleware active; login, unauthorized-access, upload and download events recorded
+- [ ] Audit log middleware active; unauthorized access, uploads, conversions and downloads recorded
 - [ ] SSH-login alert (PAM) and `auditd` rules loaded
-- [ ] fail2ban jails for sshd, nginx auth failures, 401/403 floods, rate-limit abuse and scanners
-- [ ] `healthcheck.sh` cron running; `docker stop converter-auth` produced a PROBLEM then RECOVERED alert
+- [ ] fail2ban jails for sshd, nginx 401/403 floods, rate-limit abuse and scanners
+- [ ] `healthcheck.sh` cron running; `docker stop converter-api` produced a PROBLEM then RECOVERED alert
 - [ ] External uptime monitor + heartbeat configured
 - [ ] Daily report arrives; logs rotated (Nginx 30 days, journal capped)
 
 **Data & operations**
-- [ ] `.env` files are mode 600 and not in Git; no secrets in Git history
+- [ ] `.env` is mode 600 and not in Git; no secrets in Git history
 - [ ] `uploads/`, `converted_files/`, `outputs/` untracked; automatic cleanup running
-- [ ] Daily DB backup + off-server copy; restore tested once
-- [ ] Uptime monitor and log checks in place
-- [ ] `pip-audit` / `govulncheck` clean; monthly update routine scheduled
+- [ ] Config backup made and copied off-server
+- [ ] `pip-audit` clean; monthly update routine scheduled
 
 ---
 
@@ -1586,8 +1434,8 @@ Test TLS at https://www.ssllabs.com/ssltest/ (aim for A/A+) and headers at https
 
 1. **Snapshot the VPS** in hPanel (keep evidence), then block traffic: `sudo ufw default deny incoming && sudo ufw reload` or detach the firewall to "deny all".
 2. Check `last -a`, `sudo lastb`, `sudo journalctl -u ssh`, `sudo ausearch -k root_commands -i`, `docker diff converter-api`, `docker ps -a`, `crontab -l` for every user, `/etc/cron.d/`, and unexpected processes (`top`). See the investigation cheat sheet in section 11.12.
-3. **Rotate everything**: `JWT_SECRET` (this logs everyone out), DB password, SMTP password, SSH keys, Hostinger/hPanel password + 2FA, Git deploy keys.
-4. Safest recovery: rebuild the VPS from a clean OS image, redeploy from Git, restore only the **database** from a known-good backup. Don't copy back executables or scripts from the old server.
-5. Find and fix how they got in (logs, outdated dependency, missing auth on an endpoint) before going live again.
+3. **Rotate everything**: API keys, SMTP password, SSH keys, Hostinger/hPanel password + 2FA, Git deploy keys.
+4. Safest recovery: rebuild the VPS from a clean OS image and redeploy from Git. Don't copy back executables or scripts from the old server. This service keeps no permanent data, so a rebuild is cheap.
+5. Find and fix how they got in (logs, outdated dependency, missing validation on an endpoint) before going live again.
 
 Also turn on **2FA** for your Hostinger account and your Git provider. Account takeover is the easiest attack and no server hardening prevents it.
